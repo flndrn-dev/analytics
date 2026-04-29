@@ -1,0 +1,275 @@
+#
+# Lean PostHog hobby compose for analytics.flndrn.com
+# Stripped of: session replay, error tracking, log/trace ingestion, Temporal
+# stack, livestream, cymbal, and standalone Rust services. Re-enable later
+# by reintroducing the matching services from posthog/docker-compose.hobby.yml.
+#
+
+x-logging: &default-logging
+    driver: json-file
+    options:
+        max-size: '50m'
+        max-file: '3'
+
+services:
+    db:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: db
+        image: ${DOCKER_REGISTRY_PREFIX:-}postgres:15.12-alpine
+        logging: *default-logging
+        volumes:
+            - postgres-data:/var/lib/postgresql/data
+
+    redis7:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: redis7
+        logging: *default-logging
+        volumes:
+            - redis7-data:/data
+
+    clickhouse:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: clickhouse
+        restart: on-failure
+        logging: *default-logging
+        depends_on:
+            - kafka
+            - zookeeper
+        volumes:
+            - ./posthog/posthog/idl:/idl
+            - ./posthog/docker/clickhouse/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+            - ./posthog/docker/clickhouse/config.xml:/etc/clickhouse-server/config.xml
+            - ./posthog/docker/clickhouse/config.d/default.xml:/etc/clickhouse-server/config.d/default.xml
+            - ./posthog/docker/clickhouse/users.xml:/etc/clickhouse-server/users.xml
+            - ./posthog/docker/clickhouse/user_defined_function.xml:/etc/clickhouse-server/user_defined_function.xml
+            - ./posthog/posthog/user_scripts:/var/lib/clickhouse/user_scripts
+            - clickhouse-data:/var/lib/clickhouse
+
+    zookeeper:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: zookeeper
+        logging: *default-logging
+        volumes:
+            - zookeeper-datalog:/datalog
+            - zookeeper-data:/data
+            - zookeeper-logs:/logs
+
+    kafka:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: kafka
+        logging: *default-logging
+        depends_on:
+            - zookeeper
+        environment:
+            KAFKA_LOG_RETENTION_MS: 3600000
+            KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+            KAFKA_LOG_RETENTION_HOURS: 1
+        volumes:
+            - kafka-data:/bitnami/kafka
+
+    kafka-init:
+        image: docker.redpanda.com/redpandadata/redpanda:v25.1.9
+        entrypoint: /bin/sh
+        logging: *default-logging
+        command:
+            - -c
+            - |
+                set -x
+                echo "Waiting for Kafka broker to accept connections..."
+                TIMEOUT=60
+                ELAPSED=0
+                until rpk topic list --brokers kafka:9092 2>/dev/null; do
+                    echo "Kafka broker not ready yet (elapsed: ${ELAPSED}s)..."
+                    sleep 2
+                    ELAPSED=$((ELAPSED + 2))
+                    if [ $ELAPSED -ge $TIMEOUT ]; then
+                        echo "Timeout waiting for Kafka broker after ${TIMEOUT}s"
+                        rpk topic list --brokers kafka:9092 || true
+                        exit 1
+                    fi
+                done
+                echo "Kafka broker is accepting requests, creating topics..."
+                for topic in clickhouse_events_json; do
+                    if rpk topic create "$$topic" --brokers kafka:9092 -p 1 -r 1 2>&1; then
+                        echo "Topic $$topic created successfully"
+                    else
+                        if rpk topic list --brokers kafka:9092 | grep -q "$$topic"; then
+                            echo "Topic $$topic already exists, continuing"
+                        else
+                            echo "Failed to create topic $$topic"
+                            exit 1
+                        fi
+                    fi
+                done
+                echo "Final topic list:"
+                rpk topic list --brokers kafka:9092
+                echo "Topics ready"
+        depends_on:
+            kafka:
+                condition: service_healthy
+
+    objectstorage:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: objectstorage
+        restart: on-failure
+        logging: *default-logging
+        volumes:
+            - objectstorage:/data
+        # Removed `ports:` — accessed only on internal Docker network
+
+    web:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: web
+        command: /compose/start
+        logging: *default-logging
+        volumes:
+            - ./compose:/compose
+        image: $REGISTRY_URL:$POSTHOG_APP_TAG
+        environment:
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            OBJECT_STORAGE_ACCESS_KEY_ID: 'object_storage_root_user'
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: 'object_storage_root_password'
+            OBJECT_STORAGE_ENDPOINT: http://objectstorage:19000
+            OBJECT_STORAGE_PUBLIC_ENDPOINT: https://$DOMAIN
+            OBJECT_STORAGE_ENABLED: true
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+            OTEL_SERVICE_NAME: 'posthog'
+            OTEL_EXPORTER_OTLP_ENDPOINT: ''
+            OTEL_SDK_DISABLED: 'true'
+            OPT_OUT_CAPTURE: ${OPT_OUT_CAPTURE:-false}
+            DEPLOYMENT: 'hobby'
+            DISABLE_SECURE_SSL_REDIRECT: '0'
+            IS_BEHIND_PROXY: '1'
+            TRUST_ALL_PROXIES: '1'
+            EMAIL_HOST: ${EMAIL_HOST:-}
+            EMAIL_PORT: ${EMAIL_PORT:-465}
+            EMAIL_HOST_USER: ${EMAIL_HOST_USER:-}
+            EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD:-}
+            EMAIL_USE_SSL: ${EMAIL_USE_SSL:-True}
+            EMAIL_USE_TLS: ${EMAIL_USE_TLS:-False}
+            EMAIL_DEFAULT_FROM: ${EMAIL_DEFAULT_FROM:-}
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+            - kafka
+            - objectstorage
+
+    worker:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: worker
+        logging: *default-logging
+        environment:
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            OBJECT_STORAGE_ACCESS_KEY_ID: 'object_storage_root_user'
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: 'object_storage_root_password'
+            OBJECT_STORAGE_ENDPOINT: http://objectstorage:19000
+            OBJECT_STORAGE_PUBLIC_ENDPOINT: https://$DOMAIN
+            OBJECT_STORAGE_ENABLED: true
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+            POSTHOG_SKIP_MIGRATION_CHECKS: '1'
+            EMAIL_HOST: ${EMAIL_HOST:-}
+            EMAIL_PORT: ${EMAIL_PORT:-465}
+            EMAIL_HOST_USER: ${EMAIL_HOST_USER:-}
+            EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD:-}
+            EMAIL_USE_SSL: ${EMAIL_USE_SSL:-True}
+            EMAIL_USE_TLS: ${EMAIL_USE_TLS:-False}
+            EMAIL_DEFAULT_FROM: ${EMAIL_DEFAULT_FROM:-}
+        image: $REGISTRY_URL:$POSTHOG_APP_TAG
+        depends_on:
+            db:
+                condition: service_healthy
+            redis7:
+                condition: service_healthy
+            clickhouse:
+                condition: service_started
+            kafka:
+                condition: service_healthy
+            web:
+                condition: service_started
+
+    plugins:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: plugins
+        image: ${REGISTRY_URL}-node:${POSTHOG_NODE_TAG:-latest}
+        logging: *default-logging
+        environment:
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            OBJECT_STORAGE_ACCESS_KEY_ID: 'object_storage_root_user'
+            OBJECT_STORAGE_SECRET_ACCESS_KEY: 'object_storage_root_password'
+            OBJECT_STORAGE_ENDPOINT: http://objectstorage:19000
+            OBJECT_STORAGE_PUBLIC_ENDPOINT: https://$DOMAIN
+            OBJECT_STORAGE_ENABLED: true
+            CDP_REDIS_HOST: redis7
+            CDP_REDIS_PORT: 6379
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+            CYCLOTRON_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            PERSONS_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            BEHAVIORAL_COHORTS_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            OTEL_EXPORTER_OTLP_ENDPOINT: ''
+        volumes:
+            - ./share:/share
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+            - kafka
+            - objectstorage
+
+    ingestion-general:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: ingestion-general
+        image: ${REGISTRY_URL}-node:${POSTHOG_NODE_TAG:-latest}
+        logging: *default-logging
+        environment:
+            PERSONS_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            BEHAVIORAL_COHORTS_DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
+            ENCRYPTION_SALT_KEYS: $ENCRYPTION_SALT_KEYS
+        depends_on:
+            - db
+            - redis7
+            - clickhouse
+            - kafka
+
+    capture:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: capture
+        logging: *default-logging
+        depends_on:
+            kafka-init:
+                condition: service_completed_successfully
+
+    asyncmigrationscheck:
+        extends:
+            file: ./posthog/docker-compose.base.yml
+            service: asyncmigrationscheck
+        image: $REGISTRY_URL:$POSTHOG_APP_TAG
+        logging: *default-logging
+        environment:
+            SITE_URL: https://$DOMAIN
+            SECRET_KEY: $POSTHOG_SECRET
+            SKIP_ASYNC_MIGRATIONS_SETUP: 0
+
+volumes:
+    zookeeper-data:
+    zookeeper-datalog:
+    zookeeper-logs:
+    objectstorage:
+    postgres-data:
+    clickhouse-data:
+    redis7-data:
+    kafka-data:

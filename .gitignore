@@ -1,0 +1,5 @@
+.env
+.env.local
+.env.*.local
+share/GeoLite2-City.*
+.DS_Store
