@@ -3,18 +3,24 @@
 # Routing handled by Dokploy/Traefik via the dokploy-network attachment.
 #
 # Required env vars (set in Dokploy's Environment tab — see .env.example):
-#   DB_PASSWORD  postgres password (generated, never committed)
-#   APP_SECRET   umami session-signing secret (generated, never committed)
+#   DB_PASSWORD                postgres password (generated, never committed)
+#   APP_SECRET                 umami session-signing secret (generated, never committed)
+#   POLAR_WEBHOOK_SECRET       webhook secret from Polar dashboard
+#   UMAMI_REVENUE_WEBSITE_ID   Umami website UUID that receives Polar payments
 
 services:
     umami:
-        image: ghcr.io/umami-software/umami:postgresql-latest
+        build:
+            context: https://github.com/flndrn-dev/umami-analytics.git#main
+            dockerfile: Dockerfile
         restart: always
         environment:
             DATABASE_URL: postgresql://umami:${DB_PASSWORD}@db:5432/umami
             DATABASE_TYPE: postgresql
             APP_SECRET: ${APP_SECRET}
             DISABLE_TELEMETRY: '1'
+            POLAR_WEBHOOK_SECRET: ${POLAR_WEBHOOK_SECRET}
+            UMAMI_REVENUE_WEBSITE_ID: ${UMAMI_REVENUE_WEBSITE_ID}
         depends_on:
             db:
                 condition: service_healthy
